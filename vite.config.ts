@@ -127,10 +127,12 @@ export default defineConfig(({ mode }) => {
       },
       sourcemap: true,
       rollupOptions: {
-        external: ["three"],
+        external: ["three", "three/webgpu", "three/tsl"],
         output: {
           globals: {
             three: "THREE",
+            "three/webgpu": "THREE",
+            "three/tsl": "THREE.TSL",
           },
         },
       },
@@ -157,7 +159,7 @@ export default defineConfig(({ mode }) => {
 
     optimizeDeps: {
       force: true,
-      exclude: ["three"], // prevent Vite pre-bundling
+      exclude: ["three", "three/webgpu", "three/tsl"], // prevent Vite pre-bundling
     },
 
     define: {

@@ -1,6 +1,14 @@
 import { getTransferable } from "./utils";
 import BundledWorker from "./worker?worker&inline";
 
+export const WORKER_TERMINATED_ERROR_MESSAGE = "Worker terminate";
+
+export function isWorkerTerminationError(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message === WORKER_TERMINATED_ERROR_MESSAGE
+  );
+}
+
 type PromiseRecord = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
@@ -86,7 +94,7 @@ export class SplatWorker {
     const messages = Object.values(this.messages);
     this.messages = {};
     for (const message of messages) {
-      message.reject(new Error("Worker terminate"));
+      message.reject(new Error(WORKER_TERMINATED_ERROR_MESSAGE));
     }
   }
 }

@@ -11,6 +11,10 @@ export {
   SparkRenderer,
   type SparkRendererOptions,
 } from "./SparkRenderer";
+export {
+  SparkWebGpuRenderer,
+  type SparkWebGpuRendererOptions,
+} from "./SparkWebGpuRenderer";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 
 export * as dyno from "./dyno";

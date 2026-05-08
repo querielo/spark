@@ -69,16 +69,19 @@
   {
     "imports": {
       "three": "../js/vendor/three/build/three.module.js",
+      "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+      "three/tsl": "../js/vendor/three/build/three.tsl.js",
       "@sparkjsdev/spark": "../../dist/spark.module.js"
     }
   }
   </script>
   <script type="module">
     import * as THREE from "three";
+    import { WebGPURenderer } from "three/webgpu";
     import {
       SplatMesh,
       SplatEdit,
-      SparkRenderer,
+      SparkWebGpuRenderer,
       SplatEditSdf,
       SplatEditSdfType,
       SplatEditRgbaBlendMode,
@@ -93,9 +96,9 @@
     const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
     camera.position.set(0, 0.3, -2.5);
 
-    const renderer = new THREE.WebGLRenderer();
+    const renderer = new WebGPURenderer({ canvas });
+    await renderer.init();
     renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.domElement);
 
     window.addEventListener('resize', onWindowResize, false);
     function onWindowResize() {
@@ -105,7 +108,7 @@
     }
 
     // Create a SparkRenderer and add it to the scene to render all the Gsplats.
-    const spark = new SparkRenderer({ renderer });
+    const spark = new SparkWebGpuRenderer({ renderer });
     scene.add(spark);
 
     const splatURL = await getAssetFileURL("fireplace.spz");

@@ -1,6 +1,7 @@
 export { OldSparkRenderer, type OldSparkRendererOptions, } from './OldSparkRenderer';
 export { OldSparkViewpoint, type OldSparkViewpointOptions, } from './OldSparkViewpoint';
 export { SparkRenderer, type SparkRendererOptions, } from './SparkRenderer';
+export { SparkWebGpuRenderer, type SparkWebGpuRendererOptions, } from './SparkWebGpuRenderer';
 export { SplatAccumulator, type GeneratorMapping } from './SplatAccumulator';
 export * as dyno from './dyno';
 export { RgbaArray, readRgbaArray } from './RgbaArray';

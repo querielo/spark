@@ -10,7 +10,7 @@ import {
 } from ".";
 import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
-import { SplatWorker } from "./SplatWorker";
+import { SplatWorker, isWorkerTerminationError } from "./SplatWorker";
 import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
 import { getShaders } from "./shaders";
 import {
@@ -73,7 +73,7 @@ export interface SparkRendererOptions {
   /*
    **
    * Minimum pixel radius for splat rendering.
-   * @default 0.0
+   * @default 2.0
    */
   minPixelRadius?: number;
   /**
@@ -315,6 +315,10 @@ export interface SparkRendererOptions {
   depthWrite?: boolean;
 }
 
+export type SparkRendererMutableOptions = Partial<
+  Omit<SparkRendererOptions, "renderer">
+>;
+
 export class SparkRenderer extends THREE.Mesh {
   renderer: THREE.WebGLRenderer;
   premultipliedAlpha: boolean;
@@ -352,6 +356,7 @@ export class SparkRenderer extends THREE.Mesh {
   updateTimeoutId = -1;
   onDirty?: () => void;
   dirty: boolean;
+  disposed = false;
 
   orderingTexture: THREE.DataTexture | null = null;
   maxSplats = 0;
@@ -453,6 +458,421 @@ export class SparkRenderer extends THREE.Mesh {
   sortPause = 0;
   sortDelay = 0;
 
+  private hasOption(
+    options: SparkRendererMutableOptions,
+    key: keyof SparkRendererMutableOptions,
+  ) {
+    return Object.prototype.hasOwnProperty.call(options, key);
+  }
+
+  private resetTarget(targetOptions: SparkRendererOptions["target"]) {
+    if (this.target) {
+      this.target.dispose();
+      this.target = undefined;
+    }
+    if (this.backTarget) {
+      this.backTarget.dispose();
+      this.backTarget = undefined;
+    }
+    this.superPixels = undefined;
+    this.targetPixels = undefined;
+    this.superXY = 1;
+
+    if (!targetOptions) {
+      return;
+    }
+
+    const {
+      width,
+      height,
+      doubleBuffer,
+      superXY: origSuperXY,
+      ...origTarget
+    } = targetOptions;
+    const superXY = Math.max(1, Math.min(4, origSuperXY ?? 1));
+    if (width * superXY > 8192 || height * superXY > 8192) {
+      throw new Error("Target size too large");
+    }
+
+    this.superXY = superXY;
+
+    const targetWidth = width * superXY;
+    const targetHeight = height * superXY;
+    const renderTargetOptions: THREE.RenderTargetOptions = {
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+      colorSpace: THREE.SRGBColorSpace,
+      ...origTarget,
+    };
+
+    this.target = new THREE.WebGLRenderTarget(
+      targetWidth,
+      targetHeight,
+      renderTargetOptions,
+    );
+    if (doubleBuffer) {
+      this.backTarget = new THREE.WebGLRenderTarget(
+        targetWidth,
+        targetHeight,
+        renderTargetOptions,
+      );
+    }
+  }
+
+  private resetAccumulators() {
+    const accumulators = new Set<SplatAccumulator>();
+    accumulators.add(this.display);
+    accumulators.add(this.current);
+    for (const accumulator of this.accumulators) {
+      accumulators.add(accumulator);
+    }
+    for (const accumulator of accumulators) {
+      accumulator.dispose();
+    }
+
+    const accumulatorOptions = {
+      extSplats: this.accumExtSplats,
+      covSplats: this.covSplats,
+    };
+    this.display = new SplatAccumulator(accumulatorOptions);
+    this.current = this.display;
+    this.accumulators = [
+      new SplatAccumulator(accumulatorOptions),
+      new SplatAccumulator(accumulatorOptions),
+    ];
+
+    this.activeSplats = 0;
+    this.display.numSplats = 0;
+    this.current.numSplats = 0;
+
+    if (this.orderingTexture) {
+      this.orderingTexture.dispose();
+      this.orderingTexture = null;
+    }
+  }
+
+  private resetLodState() {
+    for (const instance of this.lodInstances.values()) {
+      instance.texture.dispose();
+    }
+    this.lodInstances.clear();
+
+    this.lodIds.clear();
+    this.lodIdToSplats.clear();
+    this.lodInitQueue = [];
+    this.lodUpdates = [];
+    this.lodMeshes = [];
+    this.lastLod = undefined;
+    this.currentLod = undefined;
+    this.lastPixelLimit = undefined;
+    this.lastLodRaycastTime = 0;
+
+    if (this.pager) {
+      this.pager.dispose();
+      this.pager = undefined;
+    }
+    this.pagerId = 0;
+
+    if (this.lodWorker) {
+      this.lodWorker.dispose();
+      this.lodWorker = null;
+    }
+  }
+
+  applyOptions(options: SparkRendererMutableOptions) {
+    if (this.disposed) {
+      return;
+    }
+
+    let shouldResetAccumulators = false;
+    let shouldResetLod = false;
+
+    if (this.hasOption(options, "onDirty")) {
+      this.onDirty = options.onDirty;
+    }
+    if (
+      this.hasOption(options, "autoUpdate") &&
+      options.autoUpdate !== undefined
+    ) {
+      this.autoUpdate = options.autoUpdate;
+    }
+    if (
+      this.hasOption(options, "preUpdate") &&
+      options.preUpdate !== undefined
+    ) {
+      this.preUpdate = options.preUpdate;
+    }
+    if (this.hasOption(options, "clock") && options.clock) {
+      this.clock = cloneClock(options.clock);
+    }
+
+    if (
+      this.hasOption(options, "maxStdDev") &&
+      options.maxStdDev !== undefined
+    ) {
+      this.maxStdDev = options.maxStdDev;
+    }
+    if (
+      this.hasOption(options, "minPixelRadius") &&
+      options.minPixelRadius !== undefined
+    ) {
+      this.minPixelRadius = options.minPixelRadius;
+    }
+    if (
+      this.hasOption(options, "maxPixelRadius") &&
+      options.maxPixelRadius !== undefined
+    ) {
+      this.maxPixelRadius = options.maxPixelRadius;
+    }
+    if (this.hasOption(options, "minAlpha") && options.minAlpha !== undefined) {
+      this.minAlpha = options.minAlpha;
+    }
+    if (
+      this.hasOption(options, "enable2DGS") &&
+      options.enable2DGS !== undefined
+    ) {
+      this.enable2DGS = options.enable2DGS;
+    }
+    if (
+      this.hasOption(options, "preBlurAmount") &&
+      options.preBlurAmount !== undefined
+    ) {
+      this.preBlurAmount = options.preBlurAmount;
+    }
+    if (
+      this.hasOption(options, "blurAmount") &&
+      options.blurAmount !== undefined
+    ) {
+      this.blurAmount = options.blurAmount;
+    }
+    if (
+      this.hasOption(options, "focalDistance") &&
+      options.focalDistance !== undefined
+    ) {
+      this.focalDistance = options.focalDistance;
+    }
+    if (
+      this.hasOption(options, "apertureAngle") &&
+      options.apertureAngle !== undefined
+    ) {
+      this.apertureAngle = options.apertureAngle;
+    }
+    if (this.hasOption(options, "falloff") && options.falloff !== undefined) {
+      this.falloff = options.falloff;
+    }
+    if (this.hasOption(options, "clipXY") && options.clipXY !== undefined) {
+      this.clipXY = options.clipXY;
+    }
+    if (
+      this.hasOption(options, "focalAdjustment") &&
+      options.focalAdjustment !== undefined
+    ) {
+      this.focalAdjustment = options.focalAdjustment;
+    }
+    if (
+      this.hasOption(options, "encodeLinear") &&
+      options.encodeLinear !== undefined
+    ) {
+      this.encodeLinear = options.encodeLinear;
+    }
+
+    if (
+      this.hasOption(options, "sortRadial") &&
+      options.sortRadial !== undefined
+    ) {
+      this.sortRadial = options.sortRadial;
+      this.sortDirty = true;
+    }
+    if (
+      this.hasOption(options, "minSortIntervalMs") &&
+      options.minSortIntervalMs !== undefined
+    ) {
+      this.minSortIntervalMs = options.minSortIntervalMs;
+    }
+
+    if (
+      this.hasOption(options, "accumExtSplats") &&
+      options.accumExtSplats !== undefined
+    ) {
+      if (this.accumExtSplats !== options.accumExtSplats) {
+        this.accumExtSplats = options.accumExtSplats;
+        shouldResetAccumulators = true;
+      }
+    }
+    if (
+      this.hasOption(options, "covSplats") &&
+      options.covSplats !== undefined
+    ) {
+      if (this.covSplats !== options.covSplats) {
+        this.covSplats = options.covSplats;
+        shouldResetAccumulators = true;
+      }
+    }
+
+    if (
+      this.hasOption(options, "enableLod") &&
+      options.enableLod !== undefined
+    ) {
+      this.enableLod = options.enableLod;
+      if (!this.enableLod) {
+        shouldResetLod = true;
+      }
+    }
+    if (
+      this.hasOption(options, "enableDriveLod") &&
+      options.enableDriveLod !== undefined
+    ) {
+      this.enableDriveLod = options.enableDriveLod;
+    }
+    if (
+      this.hasOption(options, "enableLodFetching") &&
+      options.enableLodFetching !== undefined
+    ) {
+      this.enableLodFetching = options.enableLodFetching;
+    }
+    if (this.hasOption(options, "lodSplatCount")) {
+      this.lodSplatCount = options.lodSplatCount;
+    }
+    if (
+      this.hasOption(options, "lodSplatScale") &&
+      options.lodSplatScale !== undefined
+    ) {
+      this.lodSplatScale = options.lodSplatScale;
+    }
+    if (
+      this.hasOption(options, "lodRenderScale") &&
+      options.lodRenderScale !== undefined
+    ) {
+      this.lodRenderScale = options.lodRenderScale;
+    }
+    if (
+      this.hasOption(options, "lodInflate") &&
+      options.lodInflate !== undefined
+    ) {
+      this.lodInflate = options.lodInflate;
+    }
+    if (
+      this.hasOption(options, "pagedExtSplats") &&
+      options.pagedExtSplats !== undefined
+    ) {
+      if (this.pagedExtSplats !== options.pagedExtSplats) {
+        this.pagedExtSplats = options.pagedExtSplats;
+        shouldResetLod = true;
+      }
+    }
+    if (
+      this.hasOption(options, "maxPagedSplats") &&
+      options.maxPagedSplats !== undefined
+    ) {
+      if (this.maxPagedSplats !== options.maxPagedSplats) {
+        this.maxPagedSplats = options.maxPagedSplats;
+        shouldResetLod = true;
+      }
+    }
+    if (
+      this.hasOption(options, "numLodFetchers") &&
+      options.numLodFetchers !== undefined
+    ) {
+      if (this.numLodFetchers !== options.numLodFetchers) {
+        this.numLodFetchers = options.numLodFetchers;
+        shouldResetLod = true;
+      }
+    }
+    if (
+      this.hasOption(options, "behindFoveate") &&
+      options.behindFoveate !== undefined
+    ) {
+      this.behindFoveate = options.behindFoveate;
+    }
+    if (this.hasOption(options, "coneFov0") && options.coneFov0 !== undefined) {
+      this.coneFov0 = options.coneFov0;
+    }
+    if (this.hasOption(options, "coneFov") && options.coneFov !== undefined) {
+      this.coneFov = options.coneFov;
+    }
+    if (
+      this.hasOption(options, "coneFoveate") &&
+      options.coneFoveate !== undefined
+    ) {
+      this.coneFoveate = options.coneFoveate;
+    }
+    if (this.hasOption(options, "lodRaycast")) {
+      this.lodRaycast = options.lodRaycast;
+    }
+    if (
+      this.hasOption(options, "lodRaycastIntervalMs") &&
+      options.lodRaycastIntervalMs !== undefined
+    ) {
+      this.lodRaycastIntervalMs = options.lodRaycastIntervalMs;
+    }
+
+    if (this.hasOption(options, "target")) {
+      this.resetTarget(options.target);
+      if (options.target && !this.hasOption(options, "encodeLinear")) {
+        this.encodeLinear = true;
+      }
+    }
+
+    if (
+      this.hasOption(options, "vertexShader") &&
+      options.vertexShader !== undefined
+    ) {
+      this.material.vertexShader = options.vertexShader;
+      this.material.needsUpdate = true;
+    }
+    if (
+      this.hasOption(options, "fragmentShader") &&
+      options.fragmentShader !== undefined
+    ) {
+      this.material.fragmentShader = options.fragmentShader;
+      this.material.needsUpdate = true;
+    }
+    if (
+      this.hasOption(options, "transparent") &&
+      options.transparent !== undefined
+    ) {
+      this.material.transparent = options.transparent;
+      this.material.needsUpdate = true;
+    }
+    if (
+      this.hasOption(options, "depthTest") &&
+      options.depthTest !== undefined
+    ) {
+      this.material.depthTest = options.depthTest;
+      this.material.needsUpdate = true;
+    }
+    if (
+      this.hasOption(options, "depthWrite") &&
+      options.depthWrite !== undefined
+    ) {
+      this.material.depthWrite = options.depthWrite;
+      this.material.needsUpdate = true;
+    }
+    if (
+      this.hasOption(options, "premultipliedAlpha") &&
+      options.premultipliedAlpha !== undefined
+    ) {
+      this.premultipliedAlpha = options.premultipliedAlpha;
+      this.material.premultipliedAlpha = options.premultipliedAlpha;
+      this.material.needsUpdate = true;
+    }
+    if (this.hasOption(options, "extraUniforms") && options.extraUniforms) {
+      Object.assign(this.uniforms, options.extraUniforms);
+      this.material.needsUpdate = true;
+    }
+
+    if (shouldResetAccumulators) {
+      this.resetAccumulators();
+      shouldResetLod = true;
+    }
+    if (shouldResetLod) {
+      this.resetLodState();
+    }
+
+    this.sortDirty = true;
+    this.setDirty();
+  }
+
   constructor(options: SparkRendererOptions) {
     if (!options) {
       throw new Error("SparkRenderer options are required");
@@ -499,7 +919,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.preUpdate = options.preUpdate ?? true;
 
     this.maxStdDev = options.maxStdDev ?? Math.sqrt(8.0);
-    this.minPixelRadius = options.minPixelRadius ?? 0.0; //1.6;
+    this.minPixelRadius = options.minPixelRadius ?? 2.0;
     this.maxPixelRadius = options.maxPixelRadius ?? 512.0;
     this.accumExtSplats = options.accumExtSplats ?? false;
     this.covSplats = options.covSplats ?? false;
@@ -657,6 +1077,17 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   dispose() {
+    this.disposed = true;
+
+    if (this.updateTimeoutId !== -1) {
+      clearTimeout(this.updateTimeoutId);
+      this.updateTimeoutId = -1;
+    }
+    if (this.sortTimeoutId !== -1) {
+      clearTimeout(this.sortTimeoutId);
+      this.sortTimeoutId = -1;
+    }
+
     if (this.target) {
       this.target.dispose();
       this.target = undefined;
@@ -700,7 +1131,14 @@ export class SparkRenderer extends THREE.Mesh {
     }
   }
 
+  private isDisposeCancellation(error: unknown) {
+    return this.disposed && isWorkerTerminationError(error);
+  }
+
   setDirty() {
+    if (this.disposed) {
+      return;
+    }
     if (!this.dirty) {
       this.dirty = true;
       this.onDirty?.();
@@ -713,6 +1151,9 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera,
   ) {
     const spark = SparkRenderer.sparkOverride ?? this;
+    if (spark.disposed) {
+      return;
+    }
 
     const frame = renderer.info.render.frame;
     const isNewFrame = frame !== spark.lastFrame;
@@ -810,6 +1251,9 @@ export class SparkRenderer extends THREE.Mesh {
         if (spark.updateTimeoutId === -1) {
           spark.updateTimeoutId = setTimeout(() => {
             spark.updateTimeoutId = -1;
+            if (spark.disposed) {
+              return;
+            }
             spark.updateInternal({
               scene,
               camera: useCamera,
@@ -836,6 +1280,9 @@ export class SparkRenderer extends THREE.Mesh {
     scene: THREE.Scene;
     camera: THREE.Camera;
   }) {
+    if (this.disposed) {
+      return;
+    }
     await this.updateInternal({ scene, camera, autoUpdate: false });
   }
 
@@ -873,6 +1320,10 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera;
     autoUpdate: boolean;
   }) {
+    if (this.disposed) {
+      return;
+    }
+
     const renderer = this.renderer;
     const time = this.time ?? this.clock.getElapsedTime();
 
@@ -952,11 +1403,14 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.enableDriveLod) {
       this.driveLod({ visibleGenerators, camera, scene });
     }
+    if (this.disposed) {
+      return;
+    }
     await this.driveSort();
   }
 
   private async driveSort() {
-    if (this.sorting || !this.sortDirty) {
+    if (this.disposed || this.sorting || !this.sortDirty) {
       return;
     }
 
@@ -972,6 +1426,9 @@ export class SparkRenderer extends THREE.Mesh {
     if (now < nextSortTime) {
       this.sortTimeoutId = setTimeout(() => {
         this.sortTimeoutId = -1;
+        if (this.disposed) {
+          return;
+        }
         this.driveSort();
       }, nextSortTime - now);
       return;
@@ -981,120 +1438,140 @@ export class SparkRenderer extends THREE.Mesh {
     this.sortDirty = false;
     this.lastSortTime = now;
 
-    if (this.readPause > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.readPause));
-    }
-
-    const current = this.current;
-
-    this.sortedCenter.copy(current.viewOrigin);
-    this.sortedDir.copy(current.viewDirection);
-
-    const { numSplats, maxSplats } = current;
-    const rows = Math.max(1, Math.ceil(maxSplats / 16384));
-    const orderingMaxSplats = rows * 16384;
-    this.maxSplats = Math.max(this.maxSplats, orderingMaxSplats);
-
-    const ordering = new Uint32Array(this.maxSplats);
-    const readback = Readback.ensureBuffer(maxSplats, this.readback32);
-    this.readback32 = readback;
-
-    await this.readbackDepth({
-      current,
-      renderer: this.renderer,
-      numSplats,
-      readback,
-    });
-
-    if (this.sortPause > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.sortPause));
-    }
-
-    if (!this.sortWorker) {
-      this.sortWorker = new SplatWorker();
-    }
-    const result = (await this.sortWorker.call("sortSplats32", {
-      numSplats,
-      readback,
-      ordering,
-    })) as {
-      readback: Uint32Array<ArrayBuffer>;
-      ordering: Uint32Array;
-      activeSplats: number;
-    };
-
-    if (this.sortDelay > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
-    }
-
-    this.readback32 = result.readback;
-
-    this.activeSplats = result.activeSplats;
-
-    if (this.orderingTexture) {
-      if (rows > this.orderingTexture.image.height) {
-        this.orderingTexture.dispose();
-        this.orderingTexture = null;
+    try {
+      if (this.readPause > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.readPause));
       }
-    }
 
-    if (!this.orderingTexture) {
-      // console.log(`Allocating orderingTexture: ${4096}x${rows}`);
-      const orderingTexture = new THREE.DataTexture(
-        result.ordering,
-        4096,
-        rows,
-        THREE.RGBAIntegerFormat,
-        THREE.UnsignedIntType,
-      );
-      orderingTexture.internalFormat = "RGBA32UI";
-      orderingTexture.needsUpdate = true;
-      this.orderingTexture = orderingTexture;
-    } else {
-      const renderer = this.renderer;
-      const gl = renderer.getContext() as WebGL2RenderingContext;
-      if (!renderer.properties.has(this.orderingTexture)) {
-        this.orderingTexture.needsUpdate = true;
-      } else {
-        const props = renderer.properties.get(this.orderingTexture) as {
-          __webglTexture: WebGLTexture;
-        };
-        const glTexture = props.__webglTexture;
-        if (!glTexture) {
-          throw new Error("ordering texture not found");
+      if (this.disposed) {
+        return;
+      }
+
+      const current = this.current;
+      if (!current.target) {
+        return;
+      }
+
+      this.sortedCenter.copy(current.viewOrigin);
+      this.sortedDir.copy(current.viewDirection);
+
+      const { numSplats, maxSplats } = current;
+      const rows = Math.max(1, Math.ceil(maxSplats / 16384));
+      const orderingMaxSplats = rows * 16384;
+      this.maxSplats = Math.max(this.maxSplats, orderingMaxSplats);
+
+      const ordering = new Uint32Array(this.maxSplats);
+      const readback = Readback.ensureBuffer(maxSplats, this.readback32);
+      this.readback32 = readback;
+
+      const readbackReady = await this.readbackDepth({
+        current,
+        renderer: this.renderer,
+        numSplats,
+        readback,
+      });
+      if (!readbackReady || this.disposed) {
+        return;
+      }
+
+      if (this.sortPause > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.sortPause));
+      }
+
+      if (this.disposed) {
+        return;
+      }
+
+      if (!this.sortWorker) {
+        this.sortWorker = new SplatWorker();
+      }
+      const result = (await this.sortWorker.call("sortSplats32", {
+        numSplats,
+        readback,
+        ordering,
+      })) as {
+        readback: Uint32Array<ArrayBuffer>;
+        ordering: Uint32Array;
+        activeSplats: number;
+      };
+
+      if (this.sortDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
+      }
+
+      if (this.disposed) {
+        return;
+      }
+
+      this.readback32 = result.readback;
+
+      this.activeSplats = result.activeSplats;
+
+      if (this.orderingTexture) {
+        if (rows > this.orderingTexture.image.height) {
+          this.orderingTexture.dispose();
+          this.orderingTexture = null;
         }
-        renderer.state.activeTexture(gl.TEXTURE0);
-        renderer.state.bindTexture(gl.TEXTURE_2D, glTexture);
-        gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          0,
+      }
+
+      if (!this.orderingTexture) {
+        const orderingTexture = new THREE.DataTexture(
+          result.ordering,
           4096,
           rows,
-          gl.RGBA_INTEGER,
-          gl.UNSIGNED_INT,
-          // data,
-          result.ordering,
+          THREE.RGBAIntegerFormat,
+          THREE.UnsignedIntType,
         );
-        renderer.state.bindTexture(gl.TEXTURE_2D, null);
+        orderingTexture.internalFormat = "RGBA32UI";
+        orderingTexture.needsUpdate = true;
+        this.orderingTexture = orderingTexture;
+      } else {
+        const renderer = this.renderer;
+        const gl = renderer.getContext() as WebGL2RenderingContext;
+        if (!renderer.properties.has(this.orderingTexture)) {
+          this.orderingTexture.needsUpdate = true;
+        } else {
+          const props = renderer.properties.get(this.orderingTexture) as {
+            __webglTexture: WebGLTexture;
+          };
+          const glTexture = props.__webglTexture;
+          if (!glTexture) {
+            throw new Error("ordering texture not found");
+          }
+          renderer.state.activeTexture(gl.TEXTURE0);
+          renderer.state.bindTexture(gl.TEXTURE_2D, glTexture);
+          gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            4096,
+            rows,
+            gl.RGBA_INTEGER,
+            gl.UNSIGNED_INT,
+            result.ordering,
+          );
+          renderer.state.bindTexture(gl.TEXTURE_2D, null);
+        }
       }
-    }
 
-    // console.log(`Sorted (${this.minSortIntervalMs}) ${numSplats} splats in ${(performance.now() - now).toFixed(0)} ms`);
-
-    if (this.current.mappingVersion === current.mappingVersion) {
-      if (this.current.mappingVersion !== this.display.mappingVersion) {
-        this.accumulators.push(this.display);
-        this.display = this.current;
+      if (this.current.mappingVersion === current.mappingVersion) {
+        if (this.current.mappingVersion !== this.display.mappingVersion) {
+          this.accumulators.push(this.display);
+          this.display = this.current;
+        }
       }
+      this.setDirty();
+      this.driveSort();
+    } catch (error) {
+      if (!this.isDisposeCancellation(error)) {
+        throw error;
+      }
+    } finally {
+      this.sorting = false;
     }
-    this.sorting = false;
-    this.setDirty();
-
-    this.driveSort();
   }
 
   private ensureLodWorker() {
@@ -1226,104 +1703,110 @@ export class SparkRenderer extends THREE.Mesh {
       }
     }
 
-    this.ensureLodWorker().tryExclusive(async (worker) => {
-      if (hasPaged && !this.pager) {
-        this.pager = new SplatPager({
-          renderer: this.renderer,
-          extSplats: this.pagedExtSplats,
-          maxSplats: this.maxPagedSplats,
-          numFetchers: this.numLodFetchers,
-        });
+    void this.ensureLodWorker()
+      .tryExclusive(async (worker) => {
+        if (hasPaged && !this.pager) {
+          this.pager = new SplatPager({
+            renderer: this.renderer,
+            extSplats: this.pagedExtSplats,
+            maxSplats: this.maxPagedSplats,
+            numFetchers: this.numLodFetchers,
+          });
 
-        const { lodId } = (await worker.call("newLodTree", {
-          capacity: this.pager.maxSplats,
-        })) as { lodId: number };
-        this.pagerId = lodId;
-      }
-
-      // Assign pager to any new meshes that don't have one yet
-      // (must run every frame, not just when pager is first created)
-      if (this.pager) {
-        for (const { mesh } of this.lodMeshes) {
-          if (mesh.paged && !mesh.paged.pager) {
-            mesh.paged.pager = this.pager;
-          }
+          const { lodId } = (await worker.call("newLodTree", {
+            capacity: this.pager.maxSplats,
+          })) as { lodId: number };
+          this.pagerId = lodId;
         }
-      }
 
-      if (this.lodInitQueue.length > 0) {
-        const lodInitQueue = this.lodInitQueue;
-        this.lodInitQueue = [];
-        while (lodInitQueue.length > 0) {
-          const splats = lodInitQueue.shift();
-          if (splats) {
-            await this.initLodTree(worker, splats);
-            this.lodDirty = true;
-          }
-        }
-      }
-
-      if (this.pager) {
-        const updates = this.pager.consumeLodTreeUpdates();
-
-        for (const { splats, page, chunk, numSplats, lodTree } of updates) {
-          const record = this.lodIds.get(splats);
-          if (record) {
-            if (lodTree && chunk === 0) {
-              record.rootPage = page;
+        // Assign pager to any new meshes that don't have one yet
+        // (must run every frame, not just when pager is first created)
+        if (this.pager) {
+          for (const { mesh } of this.lodMeshes) {
+            if (mesh.paged && !mesh.paged.pager) {
+              mesh.paged.pager = this.pager;
             }
-            this.lodUpdates.push({
-              lodId: record.lodId,
-              pageBase: page * this.pager.pageSplats,
-              chunkBase: chunk * this.pager.pageSplats,
-              count: numSplats,
-              lodTreeData: lodTree,
-            });
           }
         }
-      }
 
-      if (this.lodUpdates.length > 0) {
-        const lodUpdates = this.lodUpdates;
-        this.lodUpdates = [];
-        await worker.call("updateLodTrees", { ranges: lodUpdates });
-        this.lodDirty = true;
-      }
-
-      if (this.lodDirty) {
-        const now = performance.now();
-        const deltaPred = new THREE.Vector3();
-        if (this.lastLod) {
-          const deltaTime = Math.max(1, now - this.lastLod.timestamp);
-          deltaPred
-            .copy(viewPos)
-            .sub(this.lastLod.pos)
-            .multiplyScalar(this.lastTraverseTime / deltaTime);
+        if (this.lodInitQueue.length > 0) {
+          const lodInitQueue = this.lodInitQueue;
+          this.lodInitQueue = [];
+          while (lodInitQueue.length > 0) {
+            const splats = lodInitQueue.shift();
+            if (splats) {
+              await this.initLodTree(worker, splats);
+              this.lodDirty = true;
+            }
+          }
         }
-        this.lastLod = {
-          pos: viewPos,
-          quat: viewQuat,
-          pixelScaleLimit,
-          maxSplats,
-          timestamp: now,
-        };
-        this.lodDirty = false;
 
-        await this.updateLodInstances(
-          worker,
-          deltaPred,
-          lodMeshes,
-          maxSplats,
-          viewPos,
-          viewQuat,
-          pixelScaleLimit,
-        );
-        this.currentLod = this.lastLod;
-        this.setDirty();
-      }
+        if (this.pager) {
+          const updates = this.pager.consumeLodTreeUpdates();
 
-      await this.cleanupLodTrees(worker);
-    });
+          for (const { splats, page, chunk, numSplats, lodTree } of updates) {
+            const record = this.lodIds.get(splats);
+            if (record) {
+              if (lodTree && chunk === 0) {
+                record.rootPage = page;
+              }
+              this.lodUpdates.push({
+                lodId: record.lodId,
+                pageBase: page * this.pager.pageSplats,
+                chunkBase: chunk * this.pager.pageSplats,
+                count: numSplats,
+                lodTreeData: lodTree,
+              });
+            }
+          }
+        }
+
+        if (this.lodUpdates.length > 0) {
+          const lodUpdates = this.lodUpdates;
+          this.lodUpdates = [];
+          await worker.call("updateLodTrees", { ranges: lodUpdates });
+          this.lodDirty = true;
+        }
+
+        if (this.lodDirty) {
+          const now = performance.now();
+          const deltaPred = new THREE.Vector3();
+          if (this.lastLod) {
+            const deltaTime = Math.max(1, now - this.lastLod.timestamp);
+            deltaPred
+              .copy(viewPos)
+              .sub(this.lastLod.pos)
+              .multiplyScalar(this.lastTraverseTime / deltaTime);
+          }
+          this.lastLod = {
+            pos: viewPos,
+            quat: viewQuat,
+            pixelScaleLimit,
+            maxSplats,
+            timestamp: now,
+          };
+          this.lodDirty = false;
+
+          await this.updateLodInstances(
+            worker,
+            deltaPred,
+            lodMeshes,
+            maxSplats,
+            viewPos,
+            viewQuat,
+            pixelScaleLimit,
+          );
+          this.currentLod = this.lastLod;
+          this.setDirty();
+        }
+
+        await this.cleanupLodTrees(worker);
+      })
+      ?.catch((error) => {
+        if (!this.isDisposeCancellation(error)) {
+          console.error("[SparkRenderer] LOD task failed", error);
+        }
+      });
   }
 
   private async initLodTree(
@@ -1648,12 +2131,12 @@ export class SparkRenderer extends THREE.Mesh {
     renderer: THREE.WebGLRenderer;
     numSplats: number;
     readback: Uint32Array;
-  }) {
+  }): Promise<boolean> {
     if (!renderer) {
       throw new Error("No renderer");
     }
-    if (!current.target) {
-      throw new Error("No target");
+    if (this.disposed || !current.target) {
+      return false;
     }
 
     const roundedCount =
@@ -1671,9 +2154,15 @@ export class SparkRenderer extends THREE.Mesh {
     // completion promises.
     const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
     let baseIndex = 0;
-    const promises = [];
+    const promises: Promise<unknown>[] = [];
 
     while (baseIndex < numSplats) {
+      if (this.disposed || !current.target) {
+        this.resetRenderState(renderer, renderState);
+        return false;
+      }
+      const target = current.target;
+
       const layer = Math.floor(baseIndex / layerSize);
       const layerBase = layer * layerSize;
       const layerYEnd = Math.min(
@@ -1687,10 +2176,10 @@ export class SparkRenderer extends THREE.Mesh {
         layerBase * 4,
         layerBase * 4 + readbackSize,
       );
-      renderer.setRenderTarget(current.target, layer);
+      renderer.setRenderTarget(target, layer);
 
       const promise = renderer.readRenderTargetPixelsAsync(
-        current.target,
+        target,
         0,
         0,
         SPLAT_TEX_WIDTH,
@@ -1710,7 +2199,8 @@ export class SparkRenderer extends THREE.Mesh {
     }
 
     this.resetRenderState(renderer, renderState);
-    return Promise.all(promises).then(() => readback);
+    await Promise.all(promises);
+    return true;
   }
 
   private saveRenderState(renderer: THREE.WebGLRenderer) {

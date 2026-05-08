@@ -28,6 +28,8 @@
     {
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
         "three/addons/": "/examples/js/vendor/three/examples/jsm/",
         "@sparkjsdev/spark": "../../dist/spark.module.js"
       }
@@ -35,8 +37,8 @@
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SplatMesh, PackedSplats } from "@sparkjsdev/spark";
-    import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
+    import { WebGPURenderer } from "three/webgpu";
+    import { SparkWebGpuRenderer, SplatMesh, PackedSplats } from "@sparkjsdev/spark";
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { getAssetFileURL } from "../js/get-asset-url.js";
 
@@ -45,12 +47,66 @@
     camera.position.set(0, 0, 6.5);
     camera.lookAt(0, 0, 0);
 
-    const renderer = new THREE.WebGLRenderer();
+    const renderer = new WebGPURenderer();
+    await renderer.init();
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setClearColor(new THREE.Color(0xFFFFFF), 1);
 
-    const spark = new SparkRenderer({ renderer });
+    const spark = new SparkWebGpuRenderer({ renderer });
     scene.add(spark);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.5);
+    keyLight.position.set(3, 4, 5);
+    scene.add(keyLight);
+    scene.add(new THREE.HemisphereLight(0xbfd7ff, 0x2a1a10, 1.4));
+
+    const standardMeshes = new THREE.Group();
+    scene.add(standardMeshes);
+
+    const pedestal = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.25, 1.4, 0.28, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x365f78,
+        metalness: 0.15,
+        roughness: 0.42,
+      }),
+    );
+    pedestal.position.set(0, -1.35, 0);
+    standardMeshes.add(pedestal);
+
+    const occluder = new THREE.Mesh(
+      new THREE.BoxGeometry(0.72, 0.72, 0.72),
+      new THREE.MeshStandardMaterial({
+        color: 0xf07f4f,
+        metalness: 0.05,
+        roughness: 0.35,
+      }),
+    );
+    occluder.position.set(-0.78, -0.42, 0.56);
+    standardMeshes.add(occluder);
+
+    const backSphere = new THREE.Mesh(
+      new THREE.SphereGeometry(0.46, 48, 32),
+      new THREE.MeshStandardMaterial({
+        color: 0x77b255,
+        metalness: 0.0,
+        roughness: 0.5,
+      }),
+    );
+    backSphere.position.set(1.05, -0.25, -0.72);
+    standardMeshes.add(backSphere);
+
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(1.68, 0.045, 16, 96),
+      new THREE.MeshStandardMaterial({
+        color: 0x2d2d34,
+        metalness: 0.55,
+        roughness: 0.28,
+      }),
+    );
+    ring.rotation.x = Math.PI * 0.5;
+    ring.position.y = -0.2;
+    standardMeshes.add(ring);
 
     document.body.appendChild(renderer.domElement);
 
@@ -98,6 +154,10 @@
 
       // Animate food master
       cat.position.y = -0.8 + Math.sin(time / 1000) * 0.1;
+
+      occluder.rotation.set(time / 1800, time / 2400, time / 2100);
+      backSphere.position.y = -0.25 + Math.sin(time / 900) * 0.16;
+      ring.rotation.z = time / 3000;
 
       renderer.render(scene, camera);
     });

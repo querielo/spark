@@ -1,3 +1,5 @@
+export declare const WORKER_TERMINATED_ERROR_MESSAGE = "Worker terminate";
+export declare function isWorkerTerminationError(error: unknown): boolean;
 type PromiseRecord = {
     resolve: (value: unknown) => void;
     reject: (reason?: unknown) => void;

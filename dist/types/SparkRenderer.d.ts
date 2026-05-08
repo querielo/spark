@@ -235,6 +235,7 @@ export interface SparkRendererOptions {
     depthTest?: boolean;
     depthWrite?: boolean;
 }
+export type SparkRendererMutableOptions = Partial<Omit<SparkRendererOptions, "renderer">>;
 export declare class SparkRenderer extends THREE.Mesh {
     renderer: THREE.WebGLRenderer;
     premultipliedAlpha: boolean;
@@ -267,6 +268,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     updateTimeoutId: number;
     onDirty?: () => void;
     dirty: boolean;
+    disposed: boolean;
     orderingTexture: THREE.DataTexture | null;
     maxSplats: number;
     activeSplats: number;
@@ -354,6 +356,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     readPause: number;
     sortPause: number;
     sortDelay: number;
+    private hasOption;
+    private resetTarget;
+    private resetAccumulators;
+    private resetLodState;
+    applyOptions(options: SparkRendererMutableOptions): void;
     constructor(options: SparkRendererOptions);
     static makeUniforms(): {
         renderSize: {
@@ -448,6 +455,7 @@ export declare class SparkRenderer extends THREE.Mesh {
         };
     };
     dispose(): void;
+    private isDisposeCancellation;
     setDirty(): void;
     onBeforeRender(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void;
     clearSplats(): void;
